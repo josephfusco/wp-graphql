@@ -1,0 +1,2051 @@
+<?php
+/**
+ * Plugin Name:       WPGraphQL IDE
+ * Description:       A next-gen query editor for WPGraphQL.
+ * Author:            WPGraphQL, Joseph Fusco
+ * Author URI:        https://github.com/josephfusco
+ * GitHub Plugin URI: https://github.com/wp-graphql/wpgraphql-ide
+ * License:           GPL-3
+ * License URI:       https://www.gnu.org/licenses/gpl-3.0.html
+ * Text Domain:       wpgraphql-ide
+ * Version:           4.4.0
+ * Requires PHP:      7.4
+ * Tested up to:      6.8
+ * Requires Plugins:  wp-graphql
+ *
+ * @package WPGraphQLIDE
+ */
+
+namespace WPGraphQLIDE;
+
+if ( ! defined( 'ABSPATH' ) ) {
+	exit;
+}
+
+if ( file_exists( __DIR__ . '/vendor/autoload.php' ) ) {
+	require_once __DIR__ . '/vendor/autoload.php';
+}
+
+define( 'WPGRAPHQL_IDE_VERSION', '4.4.0' );
+define( 'WPGRAPHQL_IDE_ROOT_ELEMENT_ID', 'wpgraphql-ide-root' );
+define( 'WPGRAPHQL_IDE_PLUGIN_DIR_PATH', plugin_dir_path( __FILE__ ) );
+define( 'WPGRAPHQL_IDE_PLUGIN_URL', plugin_dir_url( __FILE__ ) );
+
+// Modular feature includes — kept out of this main plugin file to avoid
+// further bloat. Each include hooks into WordPress on its own.
+require_once __DIR__ . '/includes/settings.php';
+
+/**
+ * Check if WPGraphQL is available and handle the case where it is not.
+ *
+ * @return void
+ */
+function check_wpgraphql_availability() {
+	// Check for the WPGraphQL class (available on init)
+	// Router is initialized later on after_setup_theme, but we check for it in the enqueue function
+	if ( ! class_exists( 'WPGraphQL' ) ) {
+		add_action( 'admin_notices', __NAMESPACE__ . '\\show_admin_notice' );
+	} else {
+		add_custom_capabilities();
+
+		do_action( 'wpgraphql_ide_init' );
+	}
+}
+add_action( 'plugins_loaded', __NAMESPACE__ . '\\check_wpgraphql_availability' );
+
+/**
+ * Initialize the plugin.
+ *
+ * @return void
+ */
+function initialize_plugin() {
+	add_action( 'init', __NAMESPACE__ . '\\load_ide_textdomain', 9 );
+	add_action( 'init', __NAMESPACE__ . '\\register_ide_post_type' );
+	add_action( 'init', __NAMESPACE__ . '\\register_ide_user_meta' );
+	add_action( 'admin_menu', __NAMESPACE__ . '\\register_dedicated_ide_menu' );
+	add_action( 'admin_bar_menu', __NAMESPACE__ . '\\register_wpadminbar_menus', 999 );
+	add_action( 'admin_enqueue_scripts', __NAMESPACE__ . '\\enqueue_graphql_ide_menu_icon_css' );
+	add_action( 'wp_enqueue_scripts', __NAMESPACE__ . '\\enqueue_graphql_ide_menu_icon_css' );
+	// Enqueue scripts on both admin and frontend since admin bar appears on both
+	add_action( 'admin_enqueue_scripts', __NAMESPACE__ . '\\enqueue_react_app_with_styles' );
+	add_action( 'wp_enqueue_scripts', __NAMESPACE__ . '\\enqueue_react_app_with_styles' );
+
+	add_action( 'graphql_register_settings', __NAMESPACE__ . '\\register_ide_settings' );
+	add_action( 'graphql_admin_notices_render_notices', __NAMESPACE__ . '\\graphql_admin_notices_render_notices', 10, 1 );
+	add_action( 'graphql_admin_notices_render_notice', __NAMESPACE__ . '\\graphql_admin_notices_render_notice', 10, 4 );
+
+	add_filter( 'graphql_admin_notices_is_allowed_admin_page', __NAMESPACE__ . '\\graphql_admin_notices_is_allowed_admin_page', 10, 3 );
+	add_filter( 'script_loader_tag', __NAMESPACE__ . '\\add_defer_attribute_to_script', 10, 2 );
+	add_filter( 'graphql_setting_field_config', __NAMESPACE__ . '\\update_graphiql_link_field_config', 10, 3 );
+	add_filter( 'graphql_get_setting_section_field_value', __NAMESPACE__ . '\\ensure_graphiql_link_is_unchecked', 10, 5 );
+	add_filter( 'plugin_action_links_' . plugin_basename( __FILE__ ), __NAMESPACE__ . '\\add_settings_link' );
+
+	// Scope REST queries to the current user's own documents/history.
+	add_filter( 'rest_graphql_ide_query_query', __NAMESPACE__ . '\\scope_ide_queries_to_current_user' );
+	add_filter( 'rest_graphql_ide_history_query', __NAMESPACE__ . '\\scope_ide_queries_to_current_user' );
+
+	// Enforce manage_graphql_ide capability on all IDE REST routes.
+	add_filter( 'rest_pre_dispatch', __NAMESPACE__ . '\\enforce_ide_rest_permissions', 10, 3 );
+
+	// Prevent access to documents/history owned by other users on single routes.
+	add_filter( 'rest_prepare_graphql_ide_query', __NAMESPACE__ . '\\restrict_document_to_author', 10, 3 );
+	add_filter( 'rest_prepare_graphql_ide_history', __NAMESPACE__ . '\\restrict_document_to_author', 10, 3 );
+
+	// Custom REST routes.
+	add_action( 'rest_api_init', __NAMESPACE__ . '\\register_ide_rest_routes' );
+
+	// Core plugins/modules.
+	require_once WPGRAPHQL_IDE_PLUGIN_DIR_PATH . 'plugins/query-composer-panel/query-composer-panel.php';
+	require_once WPGRAPHQL_IDE_PLUGIN_DIR_PATH . 'plugins/help-panel/help-panel.php';
+}
+add_action( 'wpgraphql_ide_init', __NAMESPACE__ . '\\initialize_plugin' );
+
+/**
+ * Register the IDE query document custom post type.
+ *
+ * Each document stores a GraphQL query, its variables, and headers.
+ * Documents are scoped to the authoring user via REST API filters.
+ *
+ * @return void
+ */
+
+/**
+ * Load the plugin textdomain.
+ *
+ * Must run before register_post_type / register_taxonomy so that
+ * label strings using __() don't trigger a just-in-time textdomain
+ * load warning on WP 6.7+.
+ *
+ * @return void
+ */
+function load_ide_textdomain() {
+	load_plugin_textdomain( 'wpgraphql-ide', false, dirname( plugin_basename( __FILE__ ) ) . '/languages' );
+}
+
+function register_ide_post_type() {
+	register_post_type(
+		'graphql_ide_query',
+		[
+			'label'               => __( 'IDE Queries', 'wpgraphql-ide' ),
+			'description'         => __( 'Saved GraphQL IDE query documents.', 'wpgraphql-ide' ),
+			'public'              => false,
+			'show_ui'             => false,
+			'show_in_rest'        => true,
+			'rest_base'           => 'graphql-ide-queries',
+			'capability_type'     => 'post',
+			'map_meta_cap'        => true,
+			'supports'            => [ 'title', 'editor', 'author', 'custom-fields', 'page-attributes' ],
+		]
+	);
+
+	$post_meta_auth = function () {
+		return current_user_can( 'manage_graphql_ide' );
+	};
+
+	$sanitize_json = function ( $value ) {
+		if ( empty( $value ) ) {
+			return '';
+		}
+		// Validate it's valid JSON if non-empty.
+		json_decode( $value );
+		return json_last_error() === JSON_ERROR_NONE ? $value : '';
+	};
+
+	register_post_meta(
+		'graphql_ide_query',
+		'_graphql_ide_variables',
+		[
+			'type'              => 'string',
+			'single'            => true,
+			'show_in_rest'      => true,
+			'default'           => '',
+			'auth_callback'     => $post_meta_auth,
+			'sanitize_callback' => $sanitize_json,
+		]
+	);
+
+	register_post_meta(
+		'graphql_ide_query',
+		'_graphql_ide_headers',
+		[
+			'type'              => 'string',
+			'single'            => true,
+			'show_in_rest'      => true,
+			'default'           => '',
+			'auth_callback'     => $post_meta_auth,
+			'sanitize_callback' => $sanitize_json,
+		]
+	);
+
+	// History CPT — global execution history, not scoped to a document.
+	register_post_type(
+		'graphql_ide_history',
+		[
+			'label'           => __( 'IDE History', 'wpgraphql-ide' ),
+			'description'     => __( 'GraphQL IDE execution history entries.', 'wpgraphql-ide' ),
+			'public'          => false,
+			'show_ui'         => false,
+			'show_in_rest'    => true,
+			'rest_base'       => 'graphql-ide-history',
+			'capability_type' => 'post',
+			'map_meta_cap'    => true,
+			'supports'        => [ 'author', 'custom-fields' ],
+		]
+	);
+
+	register_post_meta(
+		'graphql_ide_history',
+		'_graphql_ide_query',
+		[
+			'type'              => 'string',
+			'single'            => true,
+			'show_in_rest'      => true,
+			'default'           => '',
+			'auth_callback'     => $post_meta_auth,
+		]
+	);
+
+	register_post_meta(
+		'graphql_ide_history',
+		'_graphql_ide_variables',
+		[
+			'type'              => 'string',
+			'single'            => true,
+			'show_in_rest'      => true,
+			'default'           => '',
+			'auth_callback'     => $post_meta_auth,
+			'sanitize_callback' => $sanitize_json,
+		]
+	);
+
+	register_post_meta(
+		'graphql_ide_history',
+		'_graphql_ide_headers',
+		[
+			'type'              => 'string',
+			'single'            => true,
+			'show_in_rest'      => true,
+			'default'           => '',
+			'auth_callback'     => $post_meta_auth,
+			'sanitize_callback' => $sanitize_json,
+		]
+	);
+
+	register_post_meta(
+		'graphql_ide_history',
+		'_graphql_ide_duration_ms',
+		[
+			'type'          => 'integer',
+			'single'        => true,
+			'show_in_rest'  => true,
+			'default'       => 0,
+			'auth_callback' => $post_meta_auth,
+		]
+	);
+
+	register_post_meta(
+		'graphql_ide_history',
+		'_graphql_ide_status',
+		[
+			'type'          => 'string',
+			'single'        => true,
+			'show_in_rest'  => true,
+			'default'       => '',
+			'auth_callback' => $post_meta_auth,
+		]
+	);
+
+	register_post_meta(
+		'graphql_ide_history',
+		'_graphql_ide_document_id',
+		[
+			'type'          => 'integer',
+			'single'        => true,
+			'show_in_rest'  => true,
+			'default'       => 0,
+			'auth_callback' => $post_meta_auth,
+		]
+	);
+
+	register_post_meta(
+		'graphql_ide_history',
+		'_graphql_ide_is_authenticated',
+		[
+			'type'          => 'boolean',
+			'single'        => true,
+			'show_in_rest'  => true,
+			'default'       => true,
+			'auth_callback' => $post_meta_auth,
+		]
+	);
+
+	register_post_meta(
+		'graphql_ide_history',
+		'_graphql_ide_http_method',
+		[
+			'type'          => 'string',
+			'single'        => true,
+			'show_in_rest'  => true,
+			'default'       => 'POST',
+			'auth_callback' => $post_meta_auth,
+		]
+	);
+
+	// Collections taxonomy for grouping saved queries.
+	register_taxonomy(
+		'graphql_ide_collection',
+		'graphql_ide_query',
+		[
+			'labels'            => [
+				'name'          => __( 'Collections', 'wpgraphql-ide' ),
+				'singular_name' => __( 'Collection', 'wpgraphql-ide' ),
+			],
+			'public'            => false,
+			'show_in_rest'      => true,
+			'rest_base'         => 'graphql-ide-collections',
+			'hierarchical'      => true,
+			'show_ui'           => false,
+			'show_admin_column' => false,
+			'capabilities'      => [
+				'manage_terms' => 'manage_graphql_ide',
+				'edit_terms'   => 'manage_graphql_ide',
+				'delete_terms' => 'manage_graphql_ide',
+				'assign_terms' => 'manage_graphql_ide',
+			],
+		]
+	);
+}
+
+/**
+ * Register user meta fields for IDE preferences.
+ *
+ * These are exposed via the REST API so the IDE frontend can
+ * read and write user preferences with @wordpress/api-fetch.
+ *
+ * @return void
+ */
+function register_ide_user_meta() {
+	$auth_callback = function () {
+		return current_user_can( 'manage_graphql_ide' );
+	};
+
+	register_meta(
+		'user',
+		'wpgraphql_ide_theme',
+		[
+			'type'              => 'string',
+			'single'            => true,
+			'show_in_rest'      => true,
+			'default'           => '',
+			'auth_callback'     => $auth_callback,
+			'sanitize_callback' => function ( $value ) {
+				return in_array( $value, [ '', 'light', 'dark' ], true ) ? $value : '';
+			},
+		]
+	);
+
+	register_meta(
+		'user',
+		'wpgraphql_ide_persist_headers',
+		[
+			'type'          => 'boolean',
+			'single'        => true,
+			'show_in_rest'  => true,
+			'default'       => false,
+			'auth_callback' => $auth_callback,
+		]
+	);
+
+	register_meta(
+		'user',
+		'wpgraphql_ide_active_tab',
+		[
+			'type'          => 'string',
+			'single'        => true,
+			'show_in_rest'  => true,
+			'default'       => '',
+			'auth_callback' => $auth_callback,
+		]
+	);
+
+	register_meta(
+		'user',
+		'wpgraphql_ide_panel_order',
+		[
+			'type'          => 'array',
+			'single'        => true,
+			'show_in_rest'  => [
+				'schema' => [
+					'type'  => 'array',
+					'items' => [
+						'type' => 'string',
+					],
+				],
+			],
+			'default'       => [],
+			'auth_callback' => $auth_callback,
+		]
+	);
+
+	register_meta(
+		'user',
+		'wpgraphql_ide_collection_order',
+		[
+			'type'          => 'array',
+			'single'        => true,
+			'show_in_rest'  => [
+				'schema' => [
+					'type'  => 'array',
+					'items' => [
+						'type' => 'integer',
+					],
+				],
+			],
+			'default'       => [],
+			'auth_callback' => $auth_callback,
+		]
+	);
+
+	register_meta(
+		'user',
+		'wpgraphql_ide_collection_sort_modes',
+		[
+			'type'          => 'object',
+			'single'        => true,
+			'show_in_rest'  => [
+				'schema' => [
+					'type'                 => 'object',
+					'additionalProperties' => [
+						'type' => 'string',
+						'enum' => [ 'manual', 'title_asc', 'modified_desc', 'status' ],
+					],
+				],
+			],
+			'default'       => new \stdClass(),
+			'auth_callback' => $auth_callback,
+		]
+	);
+
+	register_meta(
+		'user',
+		'wpgraphql_ide_open_tabs',
+		[
+			'type'          => 'array',
+			'single'        => true,
+			'show_in_rest'  => [
+				'schema' => [
+					'type'  => 'array',
+					'items' => [
+						'type' => 'string',
+					],
+				],
+			],
+			'default'       => [],
+			'auth_callback' => $auth_callback,
+		]
+	);
+}
+
+/**
+ * Scope REST API queries for IDE documents to the current user.
+ *
+ * @param array<string, mixed> $args WP_Query arguments.
+ * @return array<string, mixed> Modified arguments.
+ */
+function scope_ide_queries_to_current_user( $args ) {
+	$args['author'] = get_current_user_id();
+	return $args;
+}
+
+/**
+ * Enforce manage_graphql_ide capability on all IDE document REST endpoints.
+ *
+ * This prevents users without the manage_graphql_ide capability from
+ * accessing the graphql-ide-queries REST routes, even if they have
+ * the edit_posts capability from the CPT's capability_type.
+ *
+ * @param mixed            $result  Response to replace the requested version with.
+ * @param \WP_REST_Server  $server  Server instance.
+ * @param \WP_REST_Request $request Request used to generate the response.
+ * @return mixed|\WP_Error
+ */
+function enforce_ide_rest_permissions( $result, $server, $request ) {
+	$route = $request->get_route();
+
+	$is_ide_route = strpos( $route, '/wp/v2/graphql-ide-queries' ) === 0
+		|| strpos( $route, '/wp/v2/graphql-ide-history' ) === 0;
+
+	if ( ! $is_ide_route ) {
+		return $result;
+	}
+
+	if ( ! current_user_can( 'manage_graphql_ide' ) ) {
+		return new \WP_Error(
+			'rest_forbidden',
+			__( 'You do not have permission to access IDE queries.', 'wpgraphql-ide' ),
+			[ 'status' => 403 ]
+		);
+	}
+
+	return $result;
+}
+
+/**
+ * Restrict single document responses to the document's author.
+ *
+ * Prevents users from accessing documents they don't own, even if
+ * they have the manage_graphql_ide capability.
+ *
+ * @param \WP_REST_Response $response The response object.
+ * @param \WP_Post          $post     The post object.
+ * @param \WP_REST_Request  $request  The request object.
+ * @return \WP_REST_Response|\WP_Error
+ */
+function restrict_document_to_author( $response, $post, $request ) {
+	if ( (int) $post->post_author !== get_current_user_id() ) {
+		return new \WP_Error(
+			'rest_forbidden',
+			__( 'You do not have permission to access this document.', 'wpgraphql-ide' ),
+			[ 'status' => 403 ]
+		);
+	}
+
+	return $response;
+}
+
+/**
+ * Show admin notice if WPGraphQL is not available.
+ *
+ * @return void
+ */
+function show_admin_notice() {
+	?>
+	<div class="notice notice-error">
+		<h3><?php esc_html_e( 'WPGraphQL IDE cannot load', 'wpgraphql-ide' ); ?></h3>
+		<ol>
+			<li><?php esc_html_e( 'WPGraphQL must be installed and active', 'wpgraphql-ide' ); ?></li>
+		</ol>
+	</div>
+	<?php
+}
+
+/**
+ * Assign custom capability to administrator role on plugin activation.
+ *
+ * Also seeds example collections + documents on first activation so a
+ * fresh install isn't an empty IDE. Seeding is gated by an option so
+ * re-activation never duplicates content.
+ */
+function wpgraphql_ide_activate(): void {
+	$administrator = get_role( 'administrator' );
+	if ( $administrator ) {
+		$administrator->add_cap( 'manage_graphql_ide' );
+	}
+
+	// Post types/taxonomies registered on `init` aren't available during
+	// activation, so register them ad-hoc before seeding.
+	if ( ! post_type_exists( 'graphql_ide_query' ) ) {
+		register_ide_post_type();
+	}
+
+	seed_example_documents();
+}
+register_activation_hook( __FILE__, __NAMESPACE__ . '\\wpgraphql_ide_activate' );
+
+/**
+ * The seed schema version. Bump this to push new example documents to
+ * existing installs. Documents are only seeded when the stored option
+ * version differs from this value, so users who deleted earlier seeds
+ * won't get them recreated unless we ship a newer set.
+ */
+const SEED_VERSION = '1';
+
+/**
+ * Wire format version for the import/export JSON. Bump on any
+ * breaking schema change (renamed/removed fields, restructured
+ * collections, etc.). Additive changes don't require a bump.
+ */
+const IMPORT_SCHEMA_VERSION = 1;
+
+/**
+ * Seed example collections and documents for the activating user.
+ * Idempotent via `wpgraphql_ide_seed_version`.
+ *
+ * Documents are seeded as published with SHA-256 content-addressed
+ * slugs (same algorithm as `handle_publish_document`), so the
+ * activated install matches the canonical example dataset exactly.
+ *
+ * @return void
+ */
+function seed_example_documents(): void {
+	if ( get_option( 'wpgraphql_ide_seed_version' ) === SEED_VERSION ) {
+		return;
+	}
+
+	$author_id = get_current_user_id();
+	if ( ! $author_id ) {
+		return;
+	}
+
+	import_documents_data( get_seed_definitions(), $author_id );
+	update_option( 'wpgraphql_ide_seed_version', SEED_VERSION, false );
+}
+
+/**
+ * Import a `{ collections: [...] }` payload as documents owned by the
+ * given user. Idempotent for published docs (SHA-256 dedup); drafts
+ * are always created fresh (drafts are mutable working copies).
+ *
+ * @param array<string,mixed> $data       Payload matching the seed JSON schema.
+ * @param int                 $author_id  Owner of imported documents.
+ * @return array{created: int, skipped: int, collections: array<int,int>}
+ */
+function import_documents_data( array $data, int $author_id ): array {
+	// Treat a missing version as v1 so legacy/un-versioned payloads
+	// (including the very first seed file) still import cleanly.
+	$version = isset( $data['version'] ) ? (int) $data['version'] : IMPORT_SCHEMA_VERSION;
+	if ( IMPORT_SCHEMA_VERSION !== $version ) {
+		return [
+			'created'     => 0,
+			'skipped'     => 0,
+			'collections' => [],
+			'error'       => sprintf(
+				/* translators: 1: payload version, 2: supported version */
+				__( 'Unsupported import schema version %1$d (this build expects version %2$d).', 'wpgraphql-ide' ),
+				$version,
+				IMPORT_SCHEMA_VERSION
+			),
+		];
+	}
+
+	$created     = 0;
+	$skipped     = 0;
+	$term_ids    = [];
+	$collections = $data['collections'] ?? [];
+
+	if ( ! is_array( $collections ) ) {
+		return [
+			'created'     => 0,
+			'skipped'     => 0,
+			'collections' => [],
+		];
+	}
+
+	foreach ( $collections as $collection ) {
+		$name = isset( $collection['name'] ) ? (string) $collection['name'] : '';
+		$docs = $collection['documents'] ?? [];
+		if ( '' === $name || ! is_array( $docs ) ) {
+			continue;
+		}
+
+		$term = term_exists( $name, 'graphql_ide_collection' );
+		if ( ! $term ) {
+			$term = wp_insert_term( $name, 'graphql_ide_collection' );
+		}
+		if ( is_wp_error( $term ) || empty( $term['term_id'] ) ) {
+			continue;
+		}
+
+		$term_id    = (int) $term['term_id'];
+		$term_ids[] = $term_id;
+
+		foreach ( $docs as $doc ) {
+			$result = upsert_document( $doc, $term_id, $author_id );
+			if ( 'created' === $result ) {
+				++$created;
+			} elseif ( 'skipped' === $result ) {
+				++$skipped;
+			}
+		}
+	}
+
+	return [
+		'created'     => $created,
+		'skipped'     => $skipped,
+		'collections' => $term_ids,
+	];
+}
+
+/**
+ * Insert or attach a single document. Returns the action taken so the
+ * importer can report counts back to the UI.
+ *
+ * @param array<string,mixed> $doc
+ * @param int                 $term_id
+ * @param int                 $author_id
+ * @return 'created'|'skipped'|'error'
+ */
+function upsert_document( array $doc, int $term_id, int $author_id ): string {
+	$query = isset( $doc['query'] ) ? (string) $doc['query'] : '';
+	if ( '' === trim( $query ) ) {
+		return 'error';
+	}
+
+	$status = ( $doc['status'] ?? 'publish' ) === 'draft' ? 'draft' : 'publish';
+	$title  = isset( $doc['title'] ) && '' !== $doc['title'] ? (string) $doc['title'] : __( 'Untitled', 'wpgraphql-ide' );
+
+	$body = $query;
+	$slug = '';
+
+	if ( 'publish' === $status ) {
+		try {
+			$ast  = \GraphQL\Language\Parser::parse( $query );
+			$body = \GraphQL\Language\Printer::doPrint( $ast );
+			$slug = hash( 'sha256', $body );
+		} catch ( \Throwable $e ) {
+			return 'error';
+		}
+
+		$existing = get_posts(
+			[
+				'post_type'      => 'graphql_ide_query',
+				'post_status'    => 'publish',
+				'name'           => $slug,
+				'posts_per_page' => 1,
+				'fields'         => 'ids',
+			]
+		);
+		if ( ! empty( $existing ) ) {
+			wp_set_object_terms( (int) $existing[0], [ $term_id ], 'graphql_ide_collection', true );
+			return 'skipped';
+		}
+	}
+
+	$postarr = [
+		'post_type'    => 'graphql_ide_query',
+		'post_status'  => $status,
+		'post_author'  => $author_id,
+		'post_title'   => $title,
+		'post_content' => $body,
+	];
+	if ( '' !== $slug ) {
+		$postarr['post_name'] = $slug;
+	}
+
+	$post_id = wp_insert_post( $postarr, true );
+	if ( is_wp_error( $post_id ) || ! $post_id ) {
+		return 'error';
+	}
+
+	wp_set_object_terms( $post_id, [ $term_id ], 'graphql_ide_collection' );
+
+	if ( ! empty( $doc['variables'] ) ) {
+		update_post_meta( $post_id, '_graphql_ide_variables', (string) $doc['variables'] );
+	}
+	if ( ! empty( $doc['headers'] ) ) {
+		update_post_meta( $post_id, '_graphql_ide_headers', (string) $doc['headers'] );
+	}
+
+	return 'created';
+}
+
+/**
+ * Build an export payload — current user's documents grouped by
+ * collection. Documents not assigned to any collection are skipped so
+ * the export round-trips through the importer cleanly.
+ *
+ * @param int $author_id
+ * @return array{collections: array<int,array{name:string,documents:array<int,array<string,mixed>>}>}
+ */
+function export_documents_data( int $author_id ): array {
+	$terms = get_terms(
+		[
+			'taxonomy'   => 'graphql_ide_collection',
+			'hide_empty' => false,
+			'orderby'    => 'name',
+			'order'      => 'ASC',
+		]
+	);
+
+	if ( is_wp_error( $terms ) ) {
+		return [
+			'version'     => IMPORT_SCHEMA_VERSION,
+			'collections' => [],
+		];
+	}
+
+	$collections = [];
+
+	foreach ( $terms as $term ) {
+		$post_ids = get_posts(
+			[
+				'post_type'      => 'graphql_ide_query',
+				'post_status'    => [ 'draft', 'publish' ],
+				'author'         => $author_id,
+				'tax_query'      => [
+					[
+						'taxonomy' => 'graphql_ide_collection',
+						'field'    => 'term_id',
+						'terms'    => $term->term_id,
+					],
+				],
+				'fields'         => 'ids',
+				'posts_per_page' => -1,
+				'orderby'        => 'date',
+				'order'          => 'ASC',
+			]
+		);
+
+		if ( empty( $post_ids ) ) {
+			continue;
+		}
+
+		$documents = [];
+		foreach ( $post_ids as $post_id ) {
+			$post = get_post( $post_id );
+			if ( ! $post ) {
+				continue;
+			}
+
+			$doc = [
+				'title' => $post->post_title,
+				'query' => $post->post_content,
+			];
+
+			$variables = (string) get_post_meta( $post->ID, '_graphql_ide_variables', true );
+			if ( '' !== $variables ) {
+				$doc['variables'] = $variables;
+			}
+
+			$headers = (string) get_post_meta( $post->ID, '_graphql_ide_headers', true );
+			if ( '' !== $headers ) {
+				$doc['headers'] = $headers;
+			}
+
+			// `publish` is the default — only emit when it differs.
+			if ( 'publish' !== $post->post_status ) {
+				$doc['status'] = $post->post_status;
+			}
+
+			$documents[] = $doc;
+		}
+
+		$collections[] = [
+			'name'      => $term->name,
+			'documents' => $documents,
+		];
+	}
+
+	return [
+		'version'     => IMPORT_SCHEMA_VERSION,
+		'collections' => $collections,
+	];
+}
+
+/**
+ * Load the canonical example dataset from `seeds/example-documents.json`.
+ * Returns the raw parsed payload — same shape the importer accepts.
+ * Edit the JSON file and bump `SEED_VERSION` to push updated examples
+ * to existing installs.
+ *
+ * @return array{collections?: array<int, array{name:string, documents:array<int,array<string,mixed>>}>}
+ */
+function get_seed_definitions(): array {
+	$path = WPGRAPHQL_IDE_PLUGIN_DIR_PATH . 'seeds/example-documents.json';
+	if ( ! file_exists( $path ) ) {
+		return [ 'collections' => [] ];
+	}
+
+	// phpcs:ignore WordPressVIPMinimum.Performance.FetchingRemoteData.FileGetContentsUnknown -- Reading a local plugin file.
+	$contents = file_get_contents( $path );
+	if ( false === $contents ) {
+		return [ 'collections' => [] ];
+	}
+
+	$data = json_decode( $contents, true );
+	return is_array( $data ) ? $data : [ 'collections' => [] ];
+}
+
+/**
+ * Adds custom capabilities to specified roles.
+ */
+function add_custom_capabilities(): void {
+	$capabilities = get_custom_capabilities();
+	$current_hash = generate_capabilities_hash( $capabilities );
+
+	if ( ! has_capabilities_hash_changed( $current_hash ) ) {
+		return;
+	}
+
+	update_roles_capabilities( $capabilities );
+	save_capabilities_hash( $current_hash );
+}
+
+/**
+ * Retrieves the custom capabilities and their associated roles for the plugin.
+ *
+ * @return array<string,mixed> The array of custom capabilities and roles.
+ */
+function get_custom_capabilities() {
+	return [
+		'manage_graphql_ide' => [ 'administrator' ],
+	];
+}
+
+/**
+ * Generate a hash for the capabilities array.
+ *
+ * @param array<string,mixed> $capabilities Array of capabilities and roles.
+ * @return string MD5 hash of the capabilities array.
+ */
+function generate_capabilities_hash( $capabilities ) {
+	return md5( (string) wp_json_encode( $capabilities ) );
+}
+
+/**
+ * Check if the capabilities hash has changed.
+ *
+ * @param string $current_hash Current hash of the capabilities array.
+ * @return bool True if the hash has changed, false otherwise.
+ */
+function has_capabilities_hash_changed( $current_hash ) {
+	$stored_hash = get_option( 'wpgraphql_ide_capabilities' );
+	return $current_hash !== $stored_hash;
+}
+
+/**
+ * Update the capabilities for the specified roles.
+ *
+ * @param array<string,mixed> $capabilities Array of capabilities and roles.
+ */
+function update_roles_capabilities( $capabilities ): void {
+	foreach ( $capabilities as $capability => $roles ) {
+		foreach ( $roles as $role_name ) {
+			$role = get_role( $role_name );
+
+			if ( $role && ! $role->has_cap( $capability ) ) {
+				$role->add_cap( $capability );
+			}
+		}
+	}
+}
+
+/**
+ * Save the new capabilities hash in the options table.
+ *
+ * @param string $current_hash Current hash of the capabilities array.
+ */
+function save_capabilities_hash( $current_hash ): void {
+	update_option( 'wpgraphql_ide_capabilities', $current_hash );
+}
+
+/**
+ * Checks if the current user has the capability required to load scripts and styles for the GraphQL IDE.
+ *
+ * @return bool Whether the user has the required capability.
+ */
+function user_has_graphql_ide_capability(): bool {
+	$capability_required = apply_filters( 'wpgraphql_ide_capability_required', 'manage_graphql_ide' );
+
+	return current_user_can( $capability_required );
+}
+
+/**
+ * Determines if the current admin page is a dedicated WPGraphQL IDE page.
+ *
+ * @return bool True if the current page is a dedicated WPGraphQL IDE page, false otherwise.
+ */
+function current_screen_is_dedicated_ide_page(): bool {
+	return is_ide_page() || is_legacy_ide_page();
+}
+
+/**
+ * Checks if the current admin page is the new WPGraphQL IDE page.
+ *
+ * @return bool True if the current page is the new WPGraphQL IDE page, false otherwise.
+ */
+function is_ide_page(): bool {
+	if ( ! function_exists( 'get_current_screen' ) ) {
+		return false;
+	}
+
+	$screen = get_current_screen();
+	if ( ! ( $screen instanceof \WP_Screen ) ) {
+		return false;
+	}
+
+	return 'graphql_page_graphql-ide' === $screen->id;
+}
+
+/**
+ * Checks if the current admin page is the legacy GraphiQL IDE page.
+ *
+ * @return bool True if the current page is the legacy GraphiQL IDE page, false otherwise.
+ */
+function is_legacy_ide_page(): bool {
+	if ( ! function_exists( 'get_current_screen' ) ) {
+		return false;
+	}
+
+	$screen = get_current_screen();
+	if ( ! ( $screen instanceof \WP_Screen ) ) {
+		return false;
+	}
+
+	return 'toplevel_page_graphiql-ide' === $screen->id;
+}
+
+/**
+ * Registers the plugin's custom menu item in the WordPress Admin Bar.
+ *
+ * @global WP_Admin_Bar $wp_admin_bar The WordPress Admin Bar instance.
+ */
+function register_wpadminbar_menus(): void {
+	if ( ! user_has_graphql_ide_capability() ) {
+		return;
+	}
+
+	global $wp_admin_bar;
+
+	$app_context = get_app_context();
+
+	// Retrieve the settings array
+	$graphql_ide_settings = get_option( 'graphql_ide_settings', [] );
+
+	// Get the specific link behavior value, default to 'drawer' if not set
+	$link_behavior = isset( $graphql_ide_settings['graphql_ide_link_behavior'] ) ? $graphql_ide_settings['graphql_ide_link_behavior'] : 'drawer';
+
+	if ( 'drawer' === $link_behavior && ! current_screen_is_dedicated_ide_page() ) {
+		// Drawer Button
+		$wp_admin_bar->add_node(
+			[
+				'id'    => 'wpgraphql-ide',
+				'title' => '<div id="' . esc_attr( WPGRAPHQL_IDE_ROOT_ELEMENT_ID ) . '"><span class="ab-icon"></span>' . esc_html( $app_context['drawerButtonLabel'] ) . '</div>',
+				'href'  => '#',
+			]
+		);
+	} elseif ( 'disabled' !== $link_behavior ) {
+		// Link to the new dedicated IDE page.
+		$wp_admin_bar->add_node(
+			[
+				'id'    => 'wpgraphql-ide',
+				'title' => '<span class="ab-icon"></span>' . esc_html( $app_context['drawerButtonLabel'] ),
+				'href'  => esc_url( admin_url( 'admin.php?page=graphql-ide' ) ),
+			]
+		);
+	}
+}
+
+/**
+ * Registers a submenu page for the dedicated GraphQL IDE and reorder the items.
+ *
+ * @see add_submenu_page() For more information on adding submenu pages.
+ * @link https://developer.wordpress.org/reference/functions/add_submenu_page/
+ */
+function register_dedicated_ide_menu(): void {
+	if ( ! user_has_graphql_ide_capability() ) {
+		return;
+	}
+
+	// Remove the legacy submenu without affecting the ability to directly link to the legacy IDE (wp-admin/admin.php?page=graphiql-ide)
+	$graphql_ide_settings = get_option( 'graphql_ide_settings', [] );
+	$show_legacy_editor   = isset( $graphql_ide_settings['graphql_ide_show_legacy_editor'] ) ? $graphql_ide_settings['graphql_ide_show_legacy_editor'] : 'off';
+
+	if ( 'off' === $show_legacy_editor ) {
+		remove_submenu_page( 'graphiql-ide', 'graphiql-ide' );
+	}
+
+	add_submenu_page(
+		'graphiql-ide',
+		esc_html__( 'GraphQL IDE', 'wpgraphql-ide' ),
+		esc_html__( 'GraphQL IDE', 'wpgraphql-ide' ),
+		'manage_graphql_ide',
+		'graphql-ide',
+		__NAMESPACE__ . '\\render_dedicated_ide_page'
+	);
+
+	// Reorder the submenu items.
+	add_action( 'admin_menu', __NAMESPACE__ . '\\reorder_graphql_submenu_items', 100 );
+}
+
+/**
+ * Reorder the submenu items under the GraphQL menu.
+ */
+function reorder_graphql_submenu_items(): void {
+	global $submenu;
+
+	if ( isset( $submenu['graphiql-ide'] ) ) {
+		$graphql_ide_settings = get_option( 'graphql_ide_settings', [] );
+		$show_legacy_editor   = isset( $graphql_ide_settings['graphql_ide_show_legacy_editor'] ) ? $graphql_ide_settings['graphql_ide_show_legacy_editor'] : 'off';
+
+		// Extract known submenu items and preserve unknown 3rd-party items.
+		$graphql_ide  = null;
+		$graphiql_ide = null;
+		$extensions   = null;
+		$settings     = null;
+		$other_items  = [];
+
+		foreach ( $submenu['graphiql-ide'] as $item ) {
+			switch ( $item[0] ) {
+				case 'GraphQL IDE':
+					$graphql_ide = $item;
+					break;
+				case 'GraphiQL IDE': // Legacy menu item.
+					$graphiql_ide = $item;
+					break;
+				case 'Extensions':
+					$extensions = $item;
+					break;
+				case 'Settings':
+					$settings = $item;
+					break;
+				default:
+					// Preserve 3rd-party submenu items.
+					$other_items[] = $item;
+					break;
+			}
+		}
+
+		// Create the reordered submenu array.
+		$ordered_submenu = [];
+
+		if ( $graphql_ide ) {
+			$ordered_submenu[] = $graphql_ide;
+		}
+		if ( 'on' === $show_legacy_editor && $graphiql_ide ) {
+			$graphiql_ide[0]   = esc_html__( 'Legacy GraphQL IDE', 'wpgraphql-ide' );
+			$ordered_submenu[] = $graphiql_ide;
+		}
+		if ( $extensions ) {
+			$ordered_submenu[] = $extensions;
+		}
+		if ( $settings ) {
+			$ordered_submenu[] = $settings;
+		}
+
+		// Append 3rd-party submenu items after our known items.
+		foreach ( $other_items as $item ) {
+			$ordered_submenu[] = $item;
+		}
+
+		// Merge the reordered submenu back into the global $submenu.
+		// phpcs:ignore WordPress.WP.GlobalVariablesOverride.Prohibited
+		$submenu['graphiql-ide'] = $ordered_submenu;
+	}
+}
+
+/**
+ * Renders the container for the dedicated IDE page for the React app to be mounted to.
+ */
+function render_dedicated_ide_page(): void {
+	echo '<div id="' . esc_attr( WPGRAPHQL_IDE_ROOT_ELEMENT_ID ) . '"></div>';
+}
+
+/**
+ * Enqueues custom CSS to set the "GraphQL IDE" menu item icon in the WordPress Admin Bar.
+ */
+function enqueue_graphql_ide_menu_icon_css(): void {
+	if ( ! user_has_graphql_ide_capability() ) {
+		return;
+	}
+
+	$custom_css = '
+        #wp-admin-bar-wpgraphql-ide .ab-icon::before,
+        #wp-admin-bar-wpgraphql-ide .ab-icon::before {
+            background-image: url("data:image/svg+xml;base64,' . base64_encode( graphql_logo_svg() ) . '");
+            background-size: 100%;
+            border-radius: 12px;
+            box-sizing: border-box;
+            content: "";
+            display: inline-block;
+            height: 24px;
+            width: 24px;
+        }
+    ';
+
+	wp_add_inline_style( 'admin-bar', wp_kses_post( $custom_css ) );
+}
+
+/**
+ * Enqueues the React application script and associated styles.
+ */
+function enqueue_react_app_with_styles(): void {
+	if ( is_legacy_ide_page() ) {
+		return;
+	}
+
+	if ( ! class_exists( '\WPGraphQL\Router' ) ) {
+		return;
+	}
+
+	if ( ! user_has_graphql_ide_capability() ) {
+		return;
+	}
+
+	// On frontend, only enqueue if admin bar is showing
+	if ( ! is_admin() ) {
+		if ( ! is_admin_bar_showing() ) {
+			return;
+		}
+	}
+
+	// Don't enqueue new styles/scripts on the legacy IDE page
+	if ( function_exists( 'get_current_screen' ) ) {
+		$screen = get_current_screen();
+		
+		if ( $screen instanceof \WP_Screen && 'toplevel_page_graphiql-ide' === $screen->id ) {
+			return;
+		}
+	}
+
+	// Check if build assets exist before including them.
+	// Build assets are generated by `npm run build` and may not exist in development.
+	$asset_file_path         = WPGRAPHQL_IDE_PLUGIN_DIR_PATH . 'build/wpgraphql-ide.asset.php';
+	$render_asset_file_path  = WPGRAPHQL_IDE_PLUGIN_DIR_PATH . 'build/wpgraphql-ide-render.asset.php';
+	$graphql_asset_file_path = WPGRAPHQL_IDE_PLUGIN_DIR_PATH . 'build/graphql.asset.php';
+
+	// Bail early if required build assets don't exist.
+	if ( ! file_exists( $asset_file_path ) || ! file_exists( $render_asset_file_path ) || ! file_exists( $graphql_asset_file_path ) ) {
+		return;
+	}
+
+	// phpcs:ignore WordPressVIPMinimum.Files.IncludingFile.UsingVariable -- Path is validated with file_exists() above
+	$asset_file = include $asset_file_path;
+	// phpcs:ignore WordPressVIPMinimum.Files.IncludingFile.UsingVariable -- Path is validated with file_exists() above
+	$render_asset_file = include $render_asset_file_path;
+	// phpcs:ignore WordPressVIPMinimum.Files.IncludingFile.UsingVariable -- Path is validated with file_exists() above
+	$graphql_asset_file = include $graphql_asset_file_path;
+
+	$app_context = get_app_context();
+
+	wp_register_script(
+		'graphql',
+		plugins_url( 'build/graphql.js', __FILE__ ),
+		$graphql_asset_file['dependencies'],
+		$graphql_asset_file['version'],
+		true // Load in footer
+	);
+
+	wp_enqueue_script(
+		'wpgraphql-ide',
+		plugins_url( 'build/wpgraphql-ide.js', __FILE__ ),
+		array_merge( $asset_file['dependencies'], [ 'graphql' ] ),
+		$asset_file['version'],
+		true
+	);
+
+	$panel_order = get_user_meta( get_current_user_id(), 'wpgraphql_ide_panel_order', true );
+
+	$localized_data = [
+		'nonce'               => wp_create_nonce( 'wp_rest' ),
+		'restUrl'             => esc_url_raw( rest_url() ),
+		'graphqlEndpoint'     => trailingslashit( site_url() ) . 'index.php?' . \WPGraphQL\Router::$route,
+		'rootElementId'       => WPGRAPHQL_IDE_ROOT_ELEMENT_ID,
+		'context'             => $app_context,
+		'isDedicatedIdePage'  => current_screen_is_dedicated_ide_page(),
+		'dedicatedIdeBaseUrl' => get_dedicated_ide_base_url(),
+		'panelOrder'          => is_array( $panel_order ) ? $panel_order : [],
+	];
+
+	/**
+	 * Allow internal modules and external extensions to inject keys into the
+	 * IDE's bootstrap data (window.WPGRAPHQL_IDE_DATA).
+	 *
+	 * @param array<string,mixed> $localized_data The bootstrap data being passed to the IDE.
+	 * @param array<string,mixed> $app_context    The current app context.
+	 */
+	$localized_data = apply_filters( 'wpgraphql_ide_localized_data', $localized_data, $app_context );
+
+	$escaped_data = wp_localize_escaped_data( $localized_data );
+
+	wp_localize_script(
+		'wpgraphql-ide',
+		'WPGRAPHQL_IDE_DATA',
+		$escaped_data
+	);
+
+	// Extensions looking to extend GraphiQL can hook in here,
+	// after the window object is established, but before the App renders
+	do_action( 'wpgraphql_ide_enqueue_script', $app_context );
+
+	wp_enqueue_script(
+		'wpgraphql-ide-render',
+		plugins_url( 'build/wpgraphql-ide-render.js', __FILE__ ),
+		array_merge( $asset_file['dependencies'], [ 'wpgraphql-ide', 'graphql' ] ),
+		$render_asset_file['version'],
+		true
+	);
+
+	wp_enqueue_style( 'wp-components' );
+	wp_enqueue_style( 'wpgraphql-ide-render', plugins_url( 'build/wpgraphql-ide-render.css', __FILE__ ), [], $render_asset_file['version'] );
+
+	// Avoid running custom styles through a build process for an improved developer experience.
+	wp_enqueue_style( 'wpgraphql-ide', plugins_url( 'styles/wpgraphql-ide.css', __FILE__ ), [], $asset_file['version'] );
+}
+
+/**
+ * Retrieves the base URL for the dedicated WPGraphQL IDE page.
+ *
+ * @return string The URL for the dedicated IDE page within the WordPress admin.
+ */
+function get_dedicated_ide_base_url(): string {
+	return menu_page_url( 'graphql-ide', false );
+}
+
+/**
+ * Retrieves the specific header of this plugin.
+ *
+ * @param string $key The plugin data key.
+ * @return string|null The version number of the plugin. Returns null if the version is not found.
+ */
+function get_plugin_header( string $key = '' ): ?string {
+	if ( ! function_exists( 'get_plugin_data' ) ) {
+		require_once ABSPATH . 'wp-admin/includes/plugin.php';
+	}
+
+	if ( empty( $key ) ) {
+		return null;
+	}
+
+	$plugin_data = get_plugin_data( __FILE__ );
+
+	if ( ! is_array( $plugin_data ) ) {
+		return null;
+	}
+
+	$plugin_header = $plugin_data[ $key ] ?? null;
+
+	return is_string( $plugin_header ) ? $plugin_header : null;
+}
+
+/**
+ * Retrieves and sanitizes external fragments.
+ *
+ * @return array<string> The sanitized array of external fragments.
+ */
+function get_external_fragments(): array {
+	// Retrieve external fragments using the filter.
+	$external_fragments = apply_filters( 'wpgraphql_ide_external_fragments', [] );
+
+	// Loop through each fragment, sanitize, and ensure it's a valid GraphQL fragment.
+	return array_filter(
+		array_map( 'sanitize_text_field', $external_fragments ),
+		static function ( string $fragment ): bool {
+			// Check if the fragment starts with "fragment" and contains "on" (basic GraphQL fragment validation).
+			return preg_match( '/^fragment\s+\w+\s+on\s+\w+\s*{/', trim( $fragment ) ) === 1;
+		}
+	);
+}
+
+/**
+ * Recursive function to escape an array or value for safe output, specifically for localizing data in WordPress.
+ *
+ * @param mixed $data The data to escape.
+ * @return mixed The escaped data.
+ */
+function wp_localize_escaped_data( $data ) {
+	if ( is_array( $data ) ) {
+		return array_map( __NAMESPACE__ . '\wp_localize_escaped_data', $data );
+	} elseif ( is_string( $data ) ) {
+		// Use wp_kses_post to allow basic HTML for content and esc_url for URLs
+		return filter_var( $data, FILTER_VALIDATE_URL ) ? esc_url( $data ) : wp_kses_post( $data );
+	} elseif ( is_int( $data ) ) {
+		return absint( $data );
+	} elseif ( is_bool( $data ) ) {
+		return (bool) $data;
+	}
+
+	return $data; // Return original value if it's not a string, int, or bool.
+}
+
+/**
+ * Retrieves app context.
+ *
+ * @return array<string, mixed> The possibly filtered app context array.
+ */
+function get_app_context(): array {
+	$current_user = wp_get_current_user();
+
+	// Get the avatar URL for the current user. Returns an empty string if no user is logged in.
+	$avatar_url = $current_user->exists() ? ( get_avatar_url( $current_user->ID ) ?: '' ) : '';
+
+	$app_context = [
+		'pluginVersion'     => get_plugin_header( 'Version' ),
+		'pluginName'        => get_plugin_header( 'Name' ),
+		'externalFragments' => get_external_fragments(),
+		'avatarUrl'         => $avatar_url,
+		'drawerButtonLabel' => __( 'GraphQL IDE', 'wpgraphql-ide' ),
+	];
+
+	return apply_filters( 'wpgraphql_ide_context', $app_context );
+}
+
+/**
+ * Adds styles to hide generic admin notices on the GraphQL IDE page.
+ *
+ * @param array<int, mixed> $notices The array of notices to render.
+ */
+function graphql_admin_notices_render_notices( array $notices ): void {
+	$custom_css = '
+        body.graphql_page_graphql-ide #wpbody .wpgraphql-admin-notice {
+            display: block;
+            position: absolute;
+            top: 0;
+            right: 0;
+            z-index: 1;
+            min-width: 40%;
+        }
+        body.graphql_page_graphql-ide #wpgraphql-ide-root {
+            height: calc(100vh - var(--wp-admin--admin-bar--height) - ' . count( $notices ) * 45 . 'px);
+        }
+    ';
+
+	/**
+	 * Register and enqueue the custom CSS is needed in order to properly add inline styles.
+	 * This is needed because of the way graphql_admin_notices_render_notices is called, outside of the normal enqueue process.
+	 */
+	// phpcs:ignore WordPress.WP.EnqueuedResourceParameters.MissingVersion
+	wp_register_style( 'wpgraphql-ide-admin-notices', false );
+	wp_enqueue_style( 'wpgraphql-ide-admin-notices' );
+	wp_add_inline_style( 'wpgraphql-ide-admin-notices', wp_kses_post( $custom_css ) );
+}
+
+/**
+ * Adds styles to apply top margin to notices added via register_graphql_admin_notice.
+ *
+ * @param string               $notice_slug The slug of the notice.
+ * @param array<string, mixed> $notice The notice data.
+ * @param bool                 $is_dismissable Whether the notice is dismissable.
+ * @param int                  $count The count of notices.
+ */
+function graphql_admin_notices_render_notice( string $notice_slug, array $notice, bool $is_dismissable, int $count ): void {
+	$custom_css = '
+        body.graphql_page_graphql-ide #wpbody #wpgraphql-admin-notice-' . esc_attr( $notice_slug ) . ' {
+            top: ' . esc_attr( ( $count * 45 ) . 'px' ) . ';
+        }
+    ';
+
+	/**
+	 * Register and enqueue the custom CSS is needed in order to properly add inline styles.
+	 * This is needed because of the way graphql_admin_notices_render_notices is called, outside of the normal enqueue process.
+	 */
+	// phpcs:ignore WordPress.WP.EnqueuedResourceParameters.MissingVersion
+	wp_register_style( 'wpgraphql-ide-admin-notice', false );
+	wp_enqueue_style( 'wpgraphql-ide-admin-notice' );
+	wp_add_inline_style( 'wpgraphql-ide-admin-notice', $custom_css );
+}
+
+/**
+ * Filters to allow GraphQL admin notices to be displayed on the dedicated IDE page.
+ *
+ * @param bool               $is_plugin_scoped_page True if the current page is within scope of the plugin's pages.
+ * @param string             $current_page_id The ID of the current admin page.
+ * @param array<int, string> $allowed_pages The list of allowed pages.
+ * @return bool Whether the admin notice is allowed on the current page.
+ */
+function graphql_admin_notices_is_allowed_admin_page( bool $is_plugin_scoped_page, string $current_page_id, array $allowed_pages ): bool {
+	// If the current page is the dedicated IDE page, we want to allow notices to be displayed.
+	if ( 'graphql_page_graphql-ide' === $current_page_id ) {
+		return true;
+	}
+
+	return $is_plugin_scoped_page;
+}
+
+/**
+ * Modifies the script tag for specific scripts to add the 'defer' attribute.
+ *
+ * @param string $tag The HTML <script> tag of the enqueued script.
+ * @param string $handle The script's registered handle in WordPress.
+ * @return string Modified script tag with 'defer' attribute included if handle matches; otherwise, unchanged.
+ */
+function add_defer_attribute_to_script( string $tag, string $handle ): string {
+	if ( 'wpgraphql-ide' === $handle ) {
+		return str_replace( ' src', ' defer="defer" src', $tag );
+	}
+
+	return $tag;
+}
+
+/**
+ * Update the existing GraphiQL link field configuration to say "Legacy".
+ *
+ * @param array<string, mixed> $field_config The field configuration array.
+ * @param string               $field_name The name of the field.
+ * @param string               $section The section the field belongs to.
+ * @return array<string, mixed> The modified field configuration array.
+ */
+function update_graphiql_link_field_config( array $field_config, string $field_name, string $section ): array {
+	if ( 'show_graphiql_link_in_admin_bar' === $field_name && 'graphql_general_settings' === $section ) {
+		$field_config['desc'] = sprintf(
+			'%1$s<br><p class="description">%2$s</p>',
+			__( 'Show the GraphiQL IDE link in the WordPress Admin Bar.', 'wpgraphql-ide' ),
+			sprintf(
+				/* translators: %s: Strong opening tag */
+				__( '%1$sNote:%2$s This setting has been disabled by the new WPGraphQL IDE. Related settings are now available under the "IDE Settings" tab.', 'wpgraphql-ide' ),
+				'<strong>',
+				'</strong>'
+			)
+		);
+		$field_config['disabled'] = true;
+		$field_config['value']    = 'off';
+	}
+	return $field_config;
+}
+
+/**
+ * Ensure the `show_graphiql_link_in_admin_bar` setting is always unchecked.
+ *
+ * @param mixed                $value The value of the field.
+ * @param mixed                $default_value The default value if there is no value set.
+ * @param string               $option_name The name of the option.
+ * @param array<string, mixed> $section_fields The setting values within the section.
+ * @param string               $section_name The name of the section the setting belongs to.
+ * @return mixed The modified value of the field.
+ */
+function ensure_graphiql_link_is_unchecked( $value, $default_value, $option_name, $section_fields, $section_name ) {
+	if ( 'show_graphiql_link_in_admin_bar' === $option_name && 'graphql_general_settings' === $section_name ) {
+		return 'off';
+	}
+	return $value;
+}
+
+/**
+ * Registers custom GraphQL settings.
+ */
+function register_ide_settings(): void {
+	// Add a tab section to the GraphQL admin settings page.
+	if ( function_exists( 'register_graphql_settings_section' ) ) {
+		register_graphql_settings_section(
+			'graphql_ide_settings',
+			[
+				'title' => __( 'IDE Settings', 'wpgraphql-ide' ),
+				'desc'  => __( 'Customize your WPGraphQL IDE experience sitewide. Individual users can override these settings in their user profile.', 'wpgraphql-ide' ),
+			]
+		);
+	}
+
+	if ( function_exists( 'register_graphql_settings_field' ) ) {
+		register_graphql_settings_field(
+			'graphql_ide_settings',
+			[
+				'name'              => 'graphql_ide_link_behavior',
+				'label'             => __( 'Admin Bar Link Behavior', 'wpgraphql-ide' ),
+				'desc'              => __( 'How would you like to access the GraphQL IDE from the admin bar?', 'wpgraphql-ide' ),
+				'type'              => 'radio',
+				'options'           => [
+					'drawer'         => __( 'Drawer (recommended) — open the IDE in a slide up drawer from any page', 'wpgraphql-ide' ),
+					'dedicated_page' => sprintf(
+						wp_kses_post(
+							sprintf(
+								/* translators: %s: URL to the GraphQL IDE page */
+								__( 'Dedicated Page — direct link to <a href="%1$s">%1$s</a>', 'wpgraphql-ide' ),
+								esc_url( admin_url( 'admin.php?page=graphql-ide' ) )
+							)
+						)
+					),
+					'disabled'       => __( 'Disabled — remove the IDE link from the admin bar', 'wpgraphql-ide' ),
+				],
+				'default'           => 'drawer',
+				'sanitize_callback' => __NAMESPACE__ . '\\sanitize_custom_graphql_ide_link_behavior',
+			]
+		);
+
+		register_graphql_settings_field(
+			'graphql_ide_settings',
+			[
+				'name'  => 'graphql_ide_show_legacy_editor',
+				'label' => __( 'Show Legacy Editor', 'wpgraphql-ide' ),
+				'desc'  => __( 'Show the legacy editor', 'wpgraphql-ide' ),
+				'type'  => 'checkbox',
+			]
+		);
+	}
+}
+
+/**
+ * Sanitize the input value for the custom GraphQL IDE link behavior setting.
+ *
+ * @param string $value The input value.
+ * @return string The sanitized value.
+ */
+function sanitize_custom_graphql_ide_link_behavior( string $value ): string {
+	$valid_values = [ 'drawer', 'dedicated_page', 'disabled' ];
+
+	if ( in_array( $value, $valid_values, true ) ) {
+		return $value;
+	}
+
+	return 'drawer';
+}
+
+/**
+ * Adds a settings link to the plugin actions.
+ *
+ * @param array<int, string> $links The existing action links.
+ * @return array<int, string> The modified action links.
+ */
+function add_settings_link( array $links ): array {
+	$settings_link = sprintf(
+		'<a href="%s">%s</a>',
+		esc_url( admin_url( 'admin.php?page=graphql-settings#graphql_ide_settings' ) ),
+		esc_html__( 'Settings', 'wpgraphql-ide' )
+	);
+	array_unshift( $links, $settings_link );
+	return $links;
+}
+
+
+/**
+ * Generates the SVG logo for GraphQL.
+ *
+ * @return string The SVG logo markup.
+ */
+function graphql_logo_svg(): string {
+	$svg  = '<svg width="160" height="160" viewBox="0 0 160 160" fill="none" xmlns="http://www.w3.org/2000/svg">';
+	$svg .= '<circle cx="80" cy="80" r="64" fill="url(#paint0_radial_30_2860)"/>';
+	$svg .= '<g filter="url(#filter0_d_30_2860)">';
+	$svg .= '<path d="M81.5239 72.2556C84.2608 72.2556 86.4795 70.0369 86.4795 67.3C86.4795 64.5632 84.2608 62.3445 81.5239 62.3445C78.787 62.3445 76.5684 64.5632 76.5684 67.3C76.5684 70.0369 78.787 72.2556 81.5239 72.2556Z" fill="white"/>';
+	$svg .= '<path d="M118.588 90.4878C116.007 90.05 113.769 92.0116 113.736 94.5018C113.711 96.5294 112.592 98.4291 110.696 99.1476C107.17 100.49 103.825 97.9046 103.825 94.5555V67.5931C103.825 56.1994 95.3755 46.3915 84.0521 45.1403C71.8903 43.794 61.3928 52.3011 59.5262 63.6741C59.5262 63.6823 59.5179 63.6906 59.5096 63.6906C49.4457 65.8875 42 74.8365 42 85.4703V103.665C42 105.933 43.8377 107.77 46.1049 107.77H55.3718C57.6348 107.77 59.3527 105.92 59.3445 103.657C59.3321 100.213 62.8505 97.5742 66.4805 99.1518C68.2314 99.9157 69.2638 101.716 69.2556 103.624C69.2473 105.912 71.1015 107.766 73.3852 107.766H82.4952C84.7624 107.766 86.6 105.928 86.6 103.661V85.4951C86.6 84.8302 86.472 84.1612 86.1623 83.5748C85.3777 82.0757 83.8538 81.2291 82.2515 81.3159C82.0162 81.3283 81.7725 81.3365 81.5289 81.3365C73.7982 81.3365 67.4964 75.0471 67.4881 67.3164C67.4881 67.3123 67.4881 67.304 67.4881 67.2999L67.55 66.4657C68.058 59.5362 73.4678 53.8455 80.3973 53.3004C88.6483 52.6479 95.5737 59.181 95.5737 67.2958V94.3407C95.5737 100.663 100.666 106.779 106.926 107.638C114.954 108.741 121.863 102.575 121.999 94.7867C122.036 92.7137 120.641 90.8305 118.596 90.4837L118.588 90.4878ZM78.3367 89.7238V99.0981C78.3367 99.3252 78.1508 99.511 77.9237 99.511H77.1432C76.9697 99.511 76.8169 99.3995 76.7591 99.2343C74.9421 94.1053 70.0402 90.4258 64.3 90.4258C58.5598 90.4258 53.658 94.1095 51.8409 99.2343C51.7831 99.3995 51.6303 99.511 51.4527 99.511H50.6722C50.4451 99.511 50.2593 99.3252 50.2593 99.0981V85.4703C50.2593 79.4823 54.0048 74.3409 59.3279 72.3298C59.5592 72.2431 59.8111 72.3835 59.8689 72.623C61.9874 81.2333 69.1276 87.8985 77.9898 89.315C78.188 89.348 78.3367 89.5173 78.3367 89.7197V89.7238Z" fill="white"/>';
+	$svg .= '</g>';
+	$svg .= '<defs>';
+	$svg .= '<filter id="filter0_d_30_2860" x="34" y="37" width="96" height="78.7703" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">';
+	$svg .= '<feFlood flood-opacity="0" result="BackgroundImageFix"/>';
+	$svg .= '<feColorMatrix in="SourceAlpha" type="matrix" values="0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 127 0" result="hardAlpha"/>';
+	$svg .= '<feOffset/>';
+	$svg .= '<feGaussianBlur stdDeviation="4"/>';
+	$svg .= '<feColorMatrix type="matrix" values="0 0 0 0 0 0 0 0 0 0.141176 0 0 0 0 0.278431 0 0 0 0.1 0"/>';
+	$svg .= '<feBlend mode="normal" in2="BackgroundImageFix" result="effect1_dropShadow_30_2860"/>';
+	$svg .= '<feBlend mode="normal" in="SourceGraphic" in2="effect1_dropShadow_30_2860" result="shape"/>';
+	$svg .= '</filter>';
+	$svg .= '<radialGradient id="paint0_radial_30_2860" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(16 16) rotate(45) scale(181.019)">';
+	$svg .= '<stop stop-color="#0ECAD4"/>';
+	$svg .= '<stop offset="1" stop-color="#7A45E5"/>';
+	$svg .= '</radialGradient>';
+	$svg .= '</defs>';
+	$svg .= '</svg>';
+
+	return $svg;
+}
+
+/**
+ * Initialize the plugin tracker.
+ */
+function graphql_ide_init_appsero_telemetry(): void {
+	if ( ! class_exists( 'Appsero\Client' ) || defined( 'PHPSTAN' ) ) {
+		return;
+	}
+
+	try {
+		$client = new \Appsero\Client( 'e90103d6-2c09-4152-96e0-eb7d0d3b5c74', 'WPGraphQL IDE', __FILE__ );
+
+		/**
+		 * @var \Appsero\Insights $insights
+		 *
+		 * @phpstan-ignore varTag.type (The doctype for Appsero\Client::insights() is wrong.)
+		 */
+		$insights = $client->insights();
+
+		if ( method_exists( $insights, 'add_plugin_data' ) ) {
+			$insights->add_plugin_data();
+		}
+
+		$insights->init();
+	} catch ( \Throwable $e ) {
+		error_log( // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- Error logging is intentional here.
+			sprintf(
+				// translators: %s is the error message
+				__( 'Error initializing Appsero: %s', 'wpgraphql-ide' ),
+				$e->getMessage()
+			)
+		);
+	}
+}
+
+graphql_ide_init_appsero_telemetry();
+
+/**
+ * Register custom REST routes for the IDE.
+ *
+ * @return void
+ */
+function register_ide_rest_routes() {
+	register_rest_route(
+		'wpgraphql-ide/v1',
+		'/documents/(?P<id>\d+)/publish',
+		[
+			'methods'             => 'POST',
+			'callback'            => __NAMESPACE__ . '\\handle_publish_document',
+			'permission_callback' => function () {
+				return current_user_can( 'manage_graphql_ide' );
+			},
+			'args'                => [
+				'id' => [
+					'required'          => true,
+					'validate_callback' => function ( $param ) {
+						return is_numeric( $param );
+					},
+				],
+			],
+		]
+	);
+
+	register_rest_route(
+		'wpgraphql-ide/v1',
+		'/collections/(?P<id>\d+)/cascade',
+		[
+			'methods'             => 'DELETE',
+			'callback'            => __NAMESPACE__ . '\\handle_delete_collection_cascade',
+			'permission_callback' => function () {
+				return current_user_can( 'manage_graphql_ide' );
+			},
+			'args'                => [
+				'id' => [
+					'required'          => true,
+					'validate_callback' => function ( $param ) {
+						return is_numeric( $param );
+					},
+				],
+			],
+		]
+	);
+
+	register_rest_route(
+		'wpgraphql-ide/v1',
+		'/documents/export',
+		[
+			'methods'             => 'GET',
+			'callback'            => __NAMESPACE__ . '\\handle_export_documents',
+			'permission_callback' => function () {
+				return current_user_can( 'manage_graphql_ide' );
+			},
+		]
+	);
+
+	register_rest_route(
+		'wpgraphql-ide/v1',
+		'/documents/import',
+		[
+			'methods'             => 'POST',
+			'callback'            => __NAMESPACE__ . '\\handle_import_documents',
+			'permission_callback' => function () {
+				return current_user_can( 'manage_graphql_ide' );
+			},
+		]
+	);
+
+	register_rest_route(
+		'wpgraphql-ide/v1',
+		'/documents/reorder',
+		[
+			'methods'             => 'POST',
+			'callback'            => __NAMESPACE__ . '\\handle_reorder_documents',
+			'permission_callback' => function () {
+				return current_user_can( 'manage_graphql_ide' );
+			},
+		]
+	);
+
+	register_rest_route(
+		'wpgraphql-ide/v1',
+		'/collections/reorder',
+		[
+			'methods'             => 'POST',
+			'callback'            => __NAMESPACE__ . '\\handle_reorder_collections',
+			'permission_callback' => function () {
+				return current_user_can( 'manage_graphql_ide' );
+			},
+		]
+	);
+}
+
+/**
+ * Export the current user's documents grouped by collection. Returns
+ * the same JSON shape used by `seeds/example-documents.json` and
+ * accepted by the importer.
+ *
+ * @param \WP_REST_Request $request
+ * @return \WP_REST_Response
+ */
+function handle_export_documents( \WP_REST_Request $request ) {
+	return rest_ensure_response( export_documents_data( get_current_user_id() ) );
+}
+
+/**
+ * Import a documents JSON payload into the current user's library.
+ *
+ * @param \WP_REST_Request $request
+ * @return \WP_REST_Response|\WP_Error
+ */
+function handle_import_documents( \WP_REST_Request $request ) {
+	$body = $request->get_json_params();
+	if ( ! is_array( $body ) || empty( $body['collections'] ) ) {
+		return new \WP_Error(
+			'invalid_payload',
+			__( 'Import payload must be an object with a non-empty "collections" array.', 'wpgraphql-ide' ),
+			[ 'status' => 400 ]
+		);
+	}
+
+	$result = import_documents_data( $body, get_current_user_id() );
+	return rest_ensure_response( $result );
+}
+
+/**
+ * Persist a reorder of documents — sets `menu_order` for each post in
+ * the order provided. The post type's `page-attributes` support
+ * surfaces `menu_order` to WP REST and to the default `WP_Query` sort.
+ *
+ * @param \WP_REST_Request $request REST request.
+ * @return \WP_REST_Response|\WP_Error
+ */
+function handle_reorder_documents( \WP_REST_Request $request ) {
+	$body  = $request->get_json_params();
+	$order = isset( $body['order'] ) && is_array( $body['order'] ) ? $body['order'] : null;
+	if ( ! $order ) {
+		return new \WP_Error(
+			'invalid_payload',
+			__( 'Reorder payload must include an "order" array of post IDs.', 'wpgraphql-ide' ),
+			[ 'status' => 400 ]
+		);
+	}
+	$author_id = get_current_user_id();
+	foreach ( $order as $position => $post_id ) {
+		$post_id = (int) $post_id;
+		$post    = get_post( $post_id );
+		// Only touch posts the user owns and that match our CPT.
+		if ( ! $post || 'graphql_ide_query' !== $post->post_type || (int) $post->post_author !== $author_id ) {
+			continue;
+		}
+		wp_update_post(
+			[
+				'ID'         => $post_id,
+				'menu_order' => (int) $position,
+			]
+		);
+	}
+	return rest_ensure_response( [ 'ok' => true ] );
+}
+
+/**
+ * Persist a reorder of collections per-user via term meta. Collection
+ * order is user-scoped because terms themselves are global; per-user
+ * ordering keeps the IDE feeling personal without leaking another
+ * user's preferred order onto everyone.
+ *
+ * @param \WP_REST_Request $request REST request.
+ * @return \WP_REST_Response|\WP_Error
+ */
+function handle_reorder_collections( \WP_REST_Request $request ) {
+	$body  = $request->get_json_params();
+	$order = isset( $body['order'] ) && is_array( $body['order'] ) ? $body['order'] : null;
+	if ( ! $order ) {
+		return new \WP_Error(
+			'invalid_payload',
+			__( 'Reorder payload must include an "order" array of term IDs.', 'wpgraphql-ide' ),
+			[ 'status' => 400 ]
+		);
+	}
+	$ids = array_values( array_filter( array_map( 'intval', $order ) ) );
+	update_user_meta( get_current_user_id(), 'wpgraphql_ide_collection_order', $ids );
+	return rest_ensure_response( [ 'ok' => true ] );
+}
+
+/**
+ * Delete a collection along with all documents in it owned by the
+ * current user. Documents owned by other users are left intact —
+ * removing a shared term's assignment is enough to detach them.
+ *
+ * @param \WP_REST_Request $request REST request.
+ * @return \WP_REST_Response|\WP_Error
+ */
+function handle_delete_collection_cascade( \WP_REST_Request $request ) {
+	$term_id = (int) $request->get_param( 'id' );
+	$term    = get_term( $term_id, 'graphql_ide_collection' );
+
+	if ( ! $term || is_wp_error( $term ) ) {
+		return new \WP_Error(
+			'not_found',
+			__( 'Collection not found.', 'wpgraphql-ide' ),
+			[ 'status' => 404 ]
+		);
+	}
+
+	$user_id  = get_current_user_id();
+	$post_ids = get_posts(
+		[
+			'post_type'      => 'graphql_ide_query',
+			'post_status'    => [ 'draft', 'publish' ],
+			'author'         => $user_id,
+			'tax_query'      => [
+				[
+					'taxonomy' => 'graphql_ide_collection',
+					'field'    => 'term_id',
+					'terms'    => $term_id,
+				],
+			],
+			'fields'         => 'ids',
+			'posts_per_page' => -1,
+		]
+	);
+
+	$deleted = [];
+	foreach ( $post_ids as $post_id ) {
+		if ( wp_delete_post( (int) $post_id, true ) ) {
+			$deleted[] = (int) $post_id;
+		}
+	}
+
+	$result = wp_delete_term( $term_id, 'graphql_ide_collection' );
+	if ( is_wp_error( $result ) ) {
+		return $result;
+	}
+
+	return rest_ensure_response(
+		[
+			'collection_id'    => $term_id,
+			'deleted_post_ids' => $deleted,
+		]
+	);
+}
+
+/**
+ * Publish a draft document.
+ *
+ * Computes the SHA-256 hash of the AST-normalized query (matching
+ * Smart Cache's algorithm), sets it as the post slug, and changes
+ * the status to publish. If a published document with the same hash
+ * already exists, returns the existing document instead.
+ *
+ * @param \WP_REST_Request $request REST request.
+ * @return \WP_REST_Response|\WP_Error Response.
+ */
+function handle_publish_document( \WP_REST_Request $request ) {
+	$post_id = (int) $request->get_param( 'id' );
+	$post    = get_post( $post_id );
+
+	if ( ! $post || 'graphql_ide_query' !== $post->post_type ) {
+		return new \WP_Error(
+			'not_found',
+			__( 'Document not found.', 'wpgraphql-ide' ),
+			[ 'status' => 404 ]
+		);
+	}
+
+	// Ensure the current user owns this document.
+	if ( (int) $post->post_author !== get_current_user_id() ) {
+		return new \WP_Error(
+			'forbidden',
+			__( 'You do not have permission to publish this document.', 'wpgraphql-ide' ),
+			[ 'status' => 403 ]
+		);
+	}
+
+	$query_string = $post->post_content;
+
+	if ( empty( trim( $query_string ) ) ) {
+		return new \WP_Error(
+			'empty_query',
+			__( 'Cannot publish an empty document.', 'wpgraphql-ide' ),
+			[ 'status' => 400 ]
+		);
+	}
+
+	try {
+		// Parse and normalize the query using graphql-php (same as Smart Cache).
+		$ast        = \GraphQL\Language\Parser::parse( $query_string );
+		$normalized = \GraphQL\Language\Printer::doPrint( $ast );
+		$hash       = hash( 'sha256', $normalized );
+	} catch ( \GraphQL\Error\SyntaxError $e ) {
+		return new \WP_Error(
+			'invalid_query',
+			sprintf(
+				// translators: %s is the syntax error message.
+				__( 'Invalid GraphQL query: %s', 'wpgraphql-ide' ),
+				$e->getMessage()
+			),
+			[ 'status' => 400 ]
+		);
+	}
+
+	// Check if a published document with this hash already exists.
+	$existing = get_posts(
+		[
+			'post_type'   => 'graphql_ide_query',
+			'post_status' => 'publish',
+			'name'        => $hash,
+			'numberposts' => 1,
+		]
+	);
+
+	if ( ! empty( $existing ) ) {
+		// Document already published — return the existing one.
+		$existing_post = $existing[0];
+		return rest_ensure_response(
+			[
+				'id'            => $existing_post->ID,
+				'status'        => $existing_post->post_status,
+				'query_hash'    => $hash,
+				'already_exists' => true,
+				'message'       => __( 'This query is already published.', 'wpgraphql-ide' ),
+			]
+		);
+	}
+
+	// Publish: normalize content, set slug to hash, change status.
+	$result = wp_update_post(
+		[
+			'ID'           => $post_id,
+			'post_content' => $normalized,
+			'post_name'    => $hash,
+			'post_status'  => 'publish',
+		],
+		true
+	);
+
+	if ( is_wp_error( $result ) ) {
+		return $result;
+	}
+
+	return rest_ensure_response(
+		[
+			'id'         => $post_id,
+			'status'     => 'publish',
+			'query_hash' => $hash,
+		]
+	);
+}
+
+/**
+ * Mirror the Appsero API requests to our own telemetry server.
+ *
+ * @param bool|\WP_Error $preempt Whether to preempt the request.
+ * @param array          $args    The arguments for the request.
+ * @param string         $url     The URL for the request.
+ * @return bool|\WP_Error Whether to preempt the request.
+ */
+add_filter(
+	'pre_http_request',
+	static function ( $preempt, $args, $url ) {
+		if ( strpos( $url, 'api.appsero.com' ) === false ) {
+			return $preempt;
+		}
+
+		// Scope: only mirror this plugin's payloads, not other Appsero plugins on the site.
+		$body = is_array( $args['body'] ?? null ) ? $args['body'] : [];
+		if ( ( $body['hash'] ?? null ) !== 'e90103d6-2c09-4152-96e0-eb7d0d3b5c74' ) {
+			return $preempt;
+		}
+
+		$mirror = str_replace(
+			'https://api.appsero.com/',
+			'https://telemetry.wpgraphql.com/api/appsero/',
+			$url
+		);
+
+		wp_remote_post(
+			$mirror,
+			array_merge(
+				$args,
+				[
+					'blocking' => false,
+					'timeout'  => 3,
+				]
+			)
+		);
+
+		return $preempt; // let the real Appsero request proceed
+	},
+	10,
+	3
+);

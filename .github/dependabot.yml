@@ -1,0 +1,124 @@
+version: 2
+
+updates:
+  # Composer: wp-graphql plugin.
+  - package-ecosystem: 'composer'
+    directory: '/plugins/wp-graphql'
+    schedule:
+      interval: 'weekly'
+    cooldown:
+      semver-major-days: 30
+      semver-minor-days: 7
+      semver-patch-days: 7
+    commit-message:
+      prefix: 'fix'
+      prefix-development: 'fix'
+      include: 'scope'
+    groups:
+      # We don't bundle minor or major production assets, so they're tested individually.
+      wp-graphql-composer-dev-minor-patch:
+        dependency-type: 'development'
+        update-types: [minor, patch]
+      wp-graphql-composer-patch:
+        dependency-type: 'production'
+        update-types: [patch]
+
+  #  Composer: wp-graphql-acf plugin.
+  - package-ecosystem: 'composer'
+    directory: '/plugins/wp-graphql-acf'
+    schedule:
+      interval: 'weekly'
+    cooldown:
+      semver-major-days: 30
+      semver-minor-days: 7
+      semver-patch-days: 7
+    commit-message:
+      prefix: 'fix'
+      prefix-development: 'fix'
+      include: 'scope'
+    groups:
+      # We don't bundle minor or major production assets, so they're tested individually.
+      wp-graphql-acf-composer-dev-minor-patch:
+        dependency-type: 'development'
+        update-types: [minor, patch]
+      wp-graphql-acf-composer-patch:
+        dependency-type: 'production'
+        update-types: [patch]
+
+  #  Composer: wp-graphql-ide plugin.
+  - package-ecosystem: 'composer'
+    directory: '/plugins/wp-graphql-ide'
+    schedule:
+      interval: 'weekly'
+    cooldown:
+      semver-major-days: 30
+      semver-minor-days: 7
+      semver-patch-days: 7
+    commit-message:
+      prefix: 'fix'
+      prefix-development: 'fix'
+      include: 'scope'
+    groups:
+      # We don't bundle minor or major production assets, so they're tested individually.
+      wp-graphql-ide-composer-dev-minor-patch:
+        dependency-type: 'development'
+        update-types: [minor, patch]
+      wp-graphql-ide-composer-patch:
+        dependency-type: 'production'
+        update-types: [patch]
+
+  # Composer: wp-graphql-smart-cache plugin.
+  - package-ecosystem: 'composer'
+    directory: '/plugins/wp-graphql-smart-cache'
+    schedule:
+      interval: 'weekly'
+    cooldown:
+      semver-major-days: 30
+      semver-minor-days: 7
+      semver-patch-days: 7
+    commit-message:
+      prefix: 'fix'
+      prefix-development: 'fix'
+      include: 'scope'
+    groups:
+      # We don't bundle minor or major production assets, so they're tested individually.
+      wp-graphql-smart-cache-composer-dev-minor-patch:
+        dependency-type: 'development'
+        update-types: [minor, patch]
+      wp-graphql-smart-cache-composer-patch:
+        dependency-type: 'production'
+        update-types: [patch]
+
+  # NPM Dependencies.
+  - package-ecosystem: 'npm'
+    directory: '/'
+    schedule:
+      interval: 'weekly'
+    cooldown:
+      semver-major-days: 30
+      semver-minor-days: 7
+      semver-patch-days: 7
+    versioning-strategy: 'increase'
+    commit-message:
+      prefix: 'feat'
+      prefix-development: 'fix'
+      include: 'scope'
+    groups:
+      npm-dev-minor-patch:
+        dependency-type: 'development'
+        update-types: [minor, patch]
+      npm-prod-minor-patch:
+        dependency-type: 'production'
+        update-types: [minor, patch]
+
+  # GitHub Actions: 1x weekly. No release triggered (chore).
+  - package-ecosystem: 'github-actions'
+    directory: '/'
+    schedule:
+      interval: 'weekly'
+    commit-message:
+      prefix: 'chore'
+      include: 'scope'
+    groups:
+      github-actions-updates:
+        patterns: ['*']

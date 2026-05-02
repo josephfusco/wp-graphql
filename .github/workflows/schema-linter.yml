@@ -3,79 +3,180 @@ name: Schema Linter
 on:
   push:
     branches:
-      - develop
+      - main
+      - release/*
   pull_request:
+    types: [opened, synchronize, reopened]
     branches:
-      - develop
-      - master
+      - main
+      - release/*
+
+# Cancel previous workflow run groups that have not completed.
+concurrency:
+  # Group workflow runs by workflow name, along with the head branch ref of the pull request
+  # or otherwise the branch or tag ref.
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.head_ref || github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  run:
+  # ===========================================
+  # CHANGE DETECTION
+  # ===========================================
+  # Detects which plugins have changes to determine which schema lint jobs to run.
+  # Each plugin job depends on this and only runs if its files changed.
+  # ===========================================
+
+  detect-changes:
+    name: Detect changes
     runs-on: ubuntu-latest
-    name: Lint WPGraphQL Schema
-    services:
-      mariadb:
-        image: mariadb
-        ports:
-          - 3306:3306
-        env:
-          MYSQL_ROOT_PASSWORD: root
-        # Ensure docker waits for mariadb to start
-        options: --health-cmd="mysqladmin ping" --health-interval=10s --health-timeout=5s --health-retries=3
+    permissions:
+      contents: read
+    outputs:
+      wp-graphql: ${{ steps.filter.outputs.wp-graphql_any_changed }}
+      wp-graphql-smart-cache: ${{ steps.filter.outputs.wp-graphql-smart-cache_any_changed }}
+      # Add outputs for additional plugins here:
+      # wp-graphql-ide: ${{ steps.filter.outputs.wp-graphql-ide_any_changed }}
+      test_all: ${{ steps.check-context.outputs.test_all }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v2
+      - name: Checkout repository
+        uses: actions/checkout@v6
 
-      - name: Setup PHP w/ Composer & WP-CLI
-        uses: shivammathur/setup-php@v2
+      - name: Check context (Release PR or push to main)
+        id: check-context
+        run: |
+          TEST_ALL=false
+          # Check if Release PR
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            BRANCH_NAME="${{ github.head_ref }}"
+            if [[ "$BRANCH_NAME" =~ ^release-please-- ]]; then
+              TEST_ALL=true
+              echo "🔔 Detected Release PR - will schema lint all plugins"
+            fi
+          # Check if push to main
+          elif [[ "${{ github.event_name }}" == "push" && "${{ github.ref }}" == "refs/heads/main" ]]; then
+            TEST_ALL=true
+            echo "Push to main - will schema lint all plugins"
+          fi
+          echo "test_all=$TEST_ALL" >> $GITHUB_OUTPUT
+
+      - name: Detect changed files
+        id: filter
+        uses: tj-actions/changed-files@v47
         with:
-          php-version: 8.1
-          extensions: mbstring, intl, bcmath, exif, gd, mysqli, opcache, zip, pdo_mysql
-          coverage: none
-          tools: composer, wp-cli
+          files_yaml: |
+            wp-graphql:
+              - .github/workflows/schema-linter.yml
+              - .github/workflows/schema-linter-reusable.yml
+              - plugins/wp-graphql/**/*.php
+              - plugins/wp-graphql/composer.json
+              - plugins/wp-graphql/composer.lock
+              - .release-please-manifest.json
+            wp-graphql-smart-cache:
+              - .github/workflows/schema-linter.yml
+              - .github/workflows/schema-linter-reusable.yml
+              - plugins/wp-graphql-smart-cache/**/*.php
+              - plugins/wp-graphql-smart-cache/composer.json
+              - plugins/wp-graphql-smart-cache/composer.lock
+              # Smart cache depends on wp-graphql, so wp-graphql changes trigger smart-cache schema linting
+              - plugins/wp-graphql/**/*.php
+            # Add additional plugins here:
+            # wp-graphql-ide:
+            #   - .github/workflows/schema-linter.yml
+            #   - .github/workflows/schema-linter-reusable.yml
+            #   - plugins/wp-graphql-ide/**/*.php
+            #   - plugins/wp-graphql-ide/composer.json
+            #   - plugins/wp-graphql-ide/composer.lock
+            #   # IDE depends on wp-graphql, so wp-graphql changes trigger IDE schema linting
+            #   - plugins/wp-graphql/**/*.php
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v1
-        with:
-          node-version: 16
-
-      - name: Setup GraphQL Schema Linter
-        run: npm install -g graphql-schema-linter@^3.0 graphql@^16
-
-      - name: Setup WordPress
+      - name: Log detected changes
         run: |
-          composer run install-test-env
+          echo "wp-graphql changed: ${{ steps.filter.outputs.wp-graphql_any_changed }}"
+          echo "wp-graphql-smart-cache changed: ${{ steps.filter.outputs.wp-graphql-smart-cache_any_changed }}"
 
-      - name: Generate the Static Schema
+  # ===========================================
+  # SCHEMA LINT JOBS
+  # ===========================================
+  # Each plugin gets schema linted independently.
+  # Only runs if the plugin has changes (or if test_all is true).
+  #
+  # To add a new plugin:
+  # 1. Add a new job below (e.g., wp-graphql-ide)
+  # 2. Set component to match the release tag prefix (from release-please-config.json)
+  # 3. Set active_plugins to comma-separated list of plugins needed for schema generation
+  # 4. Add change detection output in detect-changes job above
+  # 5. Add the job to the status-check job's needs array
+  #
+  # Example for wp-graphql-acf (in monorepo; uncomment to enable schema linting):
+  # wp-graphql-acf:
+  #   name: Lint wp-graphql-acf Schema
+  #   needs: detect-changes
+  #   if: needs.detect-changes.outputs.wp-graphql-acf == 'true' || needs.detect-changes.outputs.test_all == 'true'
+  #   uses: ./.github/workflows/schema-linter-reusable.yml
+  #   with:
+  #     component: wp-graphql-acf
+  #     plugin_path: plugins/wp-graphql-acf
+  #     composer_working_dir: plugins/wp-graphql
+  #     active_plugins: 'wp-graphql,wp-graphql-acf'
+  # ===========================================
+
+  wp-graphql:
+    name: Lint wp-graphql Schema
+    needs: detect-changes
+    if: needs.detect-changes.outputs.wp-graphql == 'true' || needs.detect-changes.outputs.test_all == 'true'
+    uses: ./.github/workflows/schema-linter-reusable.yml
+    secrets: inherit
+    with:
+      component: wp-graphql
+      plugin_path: plugins/wp-graphql
+      composer_working_dir: plugins/wp-graphql
+      # Plugins to activate (relative to plugins/ directory)
+      # Empty means only wp-graphql will be active
+      active_plugins: ''
+
+  wp-graphql-smart-cache:
+    name: Lint wp-graphql-smart-cache Schema
+    needs: detect-changes
+    if: needs.detect-changes.outputs.wp-graphql-smart-cache == 'true' || needs.detect-changes.outputs.test_all == 'true'
+    uses: ./.github/workflows/schema-linter-reusable.yml
+    secrets: inherit
+    with:
+      component: wp-graphql-smart-cache
+      plugin_path: plugins/wp-graphql-smart-cache
+      composer_working_dir: plugins/wp-graphql-smart-cache
+      # Activate both core and smart-cache for schema generation
+      active_plugins: 'wp-graphql,wp-graphql-smart-cache'
+
+  # ===========================================
+  # FINAL STATUS CHECK
+  # ===========================================
+  # This job always runs and provides a consistent status check name
+  # for GitHub branch protection rules. It depends on all conditional
+  # schema lint jobs and only fails if required jobs failed (not if they were skipped).
+  # ===========================================
+
+  status-check:
+    name: 'Schema Linter'
+    runs-on: ubuntu-latest
+    needs: [detect-changes, wp-graphql, wp-graphql-smart-cache]
+    if: always() # Run even if previous jobs were skipped
+    steps:
+      - name: Check schema lint results
         run: |
-          cd /tmp/wordpress/
-          # Output: /tmp/schema.graphql
-          wp graphql generate-static-schema
-
-      - name: Lint the Static Schema
-        run: |
-          graphql-schema-linter --except=relay-connection-types-spec,relay-page-info-spec --ignore '{"defined-types-are-used":["MenuItemsWhereArgs","TermObjectUnion","TimezoneEnum"]}' /tmp/schema.graphql
-
-      - name: Display ignored linting errors
-        run: |
-          graphql-schema-linter /tmp/schema.graphql || true
-
-      - name: Get Latest tag
-        uses: actions-ecosystem/action-get-latest-tag@v1
-        id: get-latest-tag
-
-      - name: Test Schema for breaking changes
-        run: |
-          echo "Previous tagged schema ${{ steps.get-latest-tag.outputs.tag }}"
-
-      - name: Get Previous Released Schema
-        run: curl 'https://github.com/wp-graphql/wp-graphql/releases/download/${{ steps.get-latest-tag.outputs.tag }}/schema.graphql' -L  --output /tmp/${{ steps.get-latest-tag.outputs.tag }}.graphql
-
-      # https://github.com/marketplace/actions/graphql-inspector
-      - name: Install Schema Inspector
-        run: |
-          npm install @graphql-inspector/config @graphql-inspector/cli graphql
-
-      - name: Run Schema Inspector
-        run: |
-          # This schema and previous release schema
-          node_modules/.bin/graphql-inspector diff /tmp/${{ steps.get-latest-tag.outputs.tag }}.graphql /tmp/schema.graphql
+          # Check if any required jobs failed (excluding skipped)
+          if [ "${{ needs.wp-graphql.result }}" == "failure" ]; then
+            echo "❌ wp-graphql schema linting failed"
+            exit 1
+          fi
+          if [ "${{ needs.wp-graphql-smart-cache.result }}" == "failure" ]; then
+            echo "❌ wp-graphql-smart-cache schema linting failed"
+            exit 1
+          fi
+          # Allow skipped jobs (expected when files don't change)
+          if [ "${{ needs.wp-graphql.result }}" == "skipped" ]; then
+            echo "ℹ️ wp-graphql schema linting skipped (no changes detected)"
+          fi
+          if [ "${{ needs.wp-graphql-smart-cache.result }}" == "skipped" ]; then
+            echo "ℹ️ wp-graphql-smart-cache schema linting skipped (no changes detected)"
+          fi
+          echo "✅ All required schema linting passed"
