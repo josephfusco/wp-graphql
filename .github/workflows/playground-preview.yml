@@ -67,10 +67,10 @@ jobs:
             "preferredVersions": { "php": "8.3", "wp": "latest" },
             "features": { "networking": true },
             "login": true,
+            "landingPage": "/wp-admin/admin.php?page=graphql-ide",
             "steps": [
               { "step": "installPlugin", "pluginData": { "resource": "url", "url": "https://downloads.wordpress.org/plugin/wp-graphql.latest-stable.zip" }, "options": { "activate": true } },
-              { "step": "installPlugin", "pluginData": { "resource": "url", "url": "https://nightly.link/${REPO}/actions/runs/${RUN_ID}/wp-graphql-ide.zip" }, "options": { "activate": true } },
-              { "step": "goTo", "url": "/wp-admin/admin.php?page=graphql-ide" }
+              { "step": "installPlugin", "pluginData": { "resource": "url", "url": "https://nightly.link/${REPO}/actions/runs/${RUN_ID}/wp-graphql-ide.zip" }, "options": { "activate": true } }
             ]
           }
           JSON
