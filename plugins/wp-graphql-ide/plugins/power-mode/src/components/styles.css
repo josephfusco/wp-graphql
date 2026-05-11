@@ -1,0 +1,129 @@
+/**
+ * Power Mode overlay. Lives outside the IDE's #wpgraphql-ide-app root
+ * (mounted on document.body) so the canvas can cover the full viewport
+ * without competing with the IDE's own stacking context.
+ */
+
+.wpgraphql-ide-power-mode-canvas {
+	position: fixed;
+	inset: 0;
+	pointer-events: none;
+	z-index: 999999;
+}
+
+.wpgraphql-ide-power-mode-hud {
+	position: fixed;
+	bottom: 24px;
+	right: 24px;
+	z-index: 1000000;
+	display: flex;
+	align-items: center;
+	gap: 10px;
+	padding: 8px 14px 8px 8px;
+	background: rgba(20, 20, 24, 0.86);
+	color: #fff;
+	border-radius: 999px;
+	box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+	backdrop-filter: blur(8px);
+	-webkit-backdrop-filter: blur(8px);
+	font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+	transition: transform 0.18s ease, box-shadow 0.18s ease;
+}
+
+.wpgraphql-ide-power-mode-hud.just-beat {
+	transform: scale(1.08);
+	box-shadow: 0 12px 36px rgba(56, 88, 233, 0.65);
+}
+
+.wpgraphql-ide-power-mode-ring {
+	width: 48px;
+	height: 48px;
+	flex-shrink: 0;
+}
+
+.wpgraphql-ide-power-mode-ring-track {
+	fill: none;
+	stroke: rgba(255, 255, 255, 0.12);
+	stroke-width: 4;
+}
+
+.wpgraphql-ide-power-mode-ring-fill {
+	fill: none;
+	stroke: #3858e9;
+	stroke-width: 4;
+	stroke-linecap: round;
+	transform: rotate(-90deg);
+	transform-origin: 32px 32px;
+	transition: stroke-dashoffset 0.1s linear;
+}
+
+.wpgraphql-ide-power-mode-hud-text {
+	display: flex;
+	flex-direction: column;
+	line-height: 1;
+}
+
+.wpgraphql-ide-power-mode-combo {
+	font-size: 20px;
+	font-weight: 700;
+	letter-spacing: 0.02em;
+}
+
+.wpgraphql-ide-power-mode-label {
+	font-size: 10px;
+	text-transform: uppercase;
+	letter-spacing: 0.08em;
+	color: rgba(255, 255, 255, 0.6);
+	margin-top: 2px;
+}
+
+.wpgraphql-ide-power-mode-best {
+	border-left: 1px solid rgba(255, 255, 255, 0.18);
+	padding-left: 10px;
+	font-size: 11px;
+	color: rgba(255, 255, 255, 0.7);
+}
+
+.wpgraphql-ide-power-mode-best strong {
+	color: #fff;
+	font-weight: 700;
+	margin-left: 2px;
+}
+
+/*
+ * Screen shake — fired at combo milestones. Applied to the <html>
+ * element so the entire viewport tilts (and the position-fixed HUD
+ * comes along for the ride). Reduced-motion users get a no-op.
+ */
+@keyframes wpgraphql-ide-power-mode-shake {
+	0%, 100% { transform: translate(0, 0); }
+	10% { transform: translate(-4px, 2px); }
+	20% { transform: translate(4px, -2px); }
+	30% { transform: translate(-3px, 1px); }
+	40% { transform: translate(3px, 2px); }
+	50% { transform: translate(-2px, -1px); }
+	60% { transform: translate(2px, 1px); }
+	70% { transform: translate(-1px, 2px); }
+	80% { transform: translate(1px, -1px); }
+	90% { transform: translate(-1px, 0); }
+}
+
+.wpgraphql-ide-power-mode-shake {
+	animation: wpgraphql-ide-power-mode-shake 0.4s ease-in-out;
+}
+
+@media (prefers-reduced-motion: reduce) {
+	.wpgraphql-ide-power-mode-shake {
+		animation: none;
+	}
+	.wpgraphql-ide-power-mode-hud,
+	.wpgraphql-ide-power-mode-ring-fill {
+		transition: none;
+	}
+}
+
+/* Topbar toggle button — when active, the lightning glyph picks up
+ * the admin theme accent so the on/off state is visible at a glance. */
+.wpgraphql-ide-topbar-btn.is-power-mode-active {
+	color: var(--wp-admin-theme-color, #3858e9);
+}
